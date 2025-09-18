@@ -839,6 +839,7 @@ class FusedMoE(CustomOp):
         num_redundant_experts: int = 0,
         has_bias: bool = False,
         is_sequence_parallel=False,
+        use_presharded_weights: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -951,6 +952,7 @@ class FusedMoE(CustomOp):
         self.e_score_correction_bias = e_score_correction_bias
         self.apply_router_weight_on_input = apply_router_weight_on_input
         self.activation = activation
+        self.use_presharded_weights = use_presharded_weights
 
         if self.scoring_func != "softmax" and not self.use_grouped_topk:
             raise ValueError("Only softmax scoring function is supported for "
@@ -1190,10 +1192,11 @@ class FusedMoE(CustomOp):
                   tp_rank: int,
                   load_full: bool = False):
 
+        should_skip_sharding = self.use_presharded_weights or load_full
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
-        if not load_full:
+        if not should_skip_sharding:
             loaded_weight = loaded_weight.narrow(shard_dim,
                                                  shard_size * tp_rank,
                                                  shard_size)
@@ -1214,11 +1217,12 @@ class FusedMoE(CustomOp):
                  tp_rank: int,
                  load_full: bool = False):
 
+        should_skip_sharding = self.use_presharded_weights or load_full
         # Index the loaded weight for tp sharding.
         # down_proj: "RowParallel" so tp sharding on input_dim
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
-        if not load_full:
+        if not should_skip_sharding:
             loaded_weight = loaded_weight.narrow(shard_dim,
                                                  shard_size * tp_rank,
                                                  shard_size)
