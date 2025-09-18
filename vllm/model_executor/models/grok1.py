@@ -54,6 +54,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.platforms import current_platform
 
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, is_pp_missing_parameter,
@@ -64,6 +65,23 @@ from .utils import (AutoWeightsLoader, is_pp_missing_parameter,
 DEFAULT_ATTN_OUTPUT_MULTIPLIER = 0.08838834764831845
 DEFAULT_OUTPUT_MULTIPLIER_SCALE = 0.5773502691896257
 DEFAULT_EMBEDDING_MULTIPLIER_SCALE = 78.38367176906169
+
+is_hpu = getattr(current_platform, "device_type", None) == "hpu"
+def _stream_ctx(s):
+    if s is None:
+        return nullcontext()
+    if torch.cuda.is_available():
+        return torch.cuda.stream(s)
+    if hasattr(torch, "hpu") and getattr(torch.hpu, "is_available", lambda: False)():
+        return torch.hpu.stream(s)
+    return nullcontext()
+
+def _make_stream():
+    if torch.cuda.is_available():
+        return torch.cuda.Stream()
+    if hasattr(torch, "hpu") and getattr(torch.hpu, "is_available", lambda: False)():
+        return torch.hpu.Stream()
+    return None
 
 class Grok1MLP(nn.Module):
 
@@ -219,7 +237,6 @@ class Grok1Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
         rope_scaling = get_rope_scaling(config)
-        self.alt_stream = alt_stream or torch.cuda.Stream()
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -312,7 +329,7 @@ class Grok1DecoderLayer(nn.Module):
             if not self.use_fp8 and hasattr(quant_config, "is_fp8"):
                 self.use_fp8 = quant_config.is_fp8
         self.residual_moe = getattr(config, "residual_moe", False)
-        self.alt_stream = alt_stream or torch.cuda.Stream()
+        self.alt_stream = getattr(self, "alt_stream", None) or _make_stream()
         self.is_grok1 = is_grok1
 
         # Requires transformers > 4.32.0
@@ -424,6 +441,10 @@ class Grok1DecoderLayer(nn.Module):
             hidden_states, residual = self.pre_attn_norm(
                 hidden_states, residual)
 
+        if is_hpu:
+            import habana_frameworks.torch as htorch
+            htorch.core.mark_step()
+
         if self.is_grok1:
             hidden_states = self.attn(
                 positions=positions,
@@ -446,10 +467,10 @@ class Grok1DecoderLayer(nn.Module):
         return hidden_states, residual
 
     def moe_with_rmoe(self, x):
-        current_stream = torch.cuda.current_stream()
+        current_stream = self.alt_stream
         self.alt_stream.wait_stream(current_stream)
         mlp_result = self.mlp(x)
-        with torch.cuda.stream(self.alt_stream):
+        with _stream_ctx(self.alt_stream):
             # moe should not be inplace because of stream race condition
             moe_result = self.moe_block(
                 x) if self.is_grok1 else self.block_sparse_moe(x)
@@ -491,7 +512,7 @@ class Grok1Model(nn.Module):
             quant_config=quant_config,
         )
 
-        self.alt_stream = torch.cuda.Stream()
+        self.alt_stream = getattr(self, "alt_stream", None) or _make_stream()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: Grok1DecoderLayer(config,

@@ -78,3 +78,11 @@ if HAS_TRITON:
         "TritonOrDeepGemmExperts",
         "BatchedTritonOrDeepGemmExperts",
     ]
+
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod
+
+try:
+    import importlib
+    importlib.import_module("vllm_gaudi.ops.hpu_fused_moe")
+except Exception:
+    pass
