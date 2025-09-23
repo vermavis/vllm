@@ -87,3 +87,9 @@ else:
 
     fused_topk = lambda *args, **kwargs: _raise_exception("fused_topk")
     fused_experts = lambda *args, **kwargs: _raise_exception("fused_experts")
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE, UnquantizedFusedMoEMethod
+try:
+    import importlib
+    importlib.import_module("vllm_gaudi.ops.hpu_fused_moe")
+except Exception:
+    pass
